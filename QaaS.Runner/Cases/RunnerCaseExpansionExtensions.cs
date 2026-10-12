@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Extensions.Configuration;
 
 namespace QaaS.Runner.Cases;
 
@@ -60,15 +61,17 @@ public static class RunnerCaseExpansionExtensions
 
     /// <summary>
     /// Replaces the Runner's existing execution plan with builders cloned from the provided base builder,
-    /// one per test case, with each case's configuration applied.
+    /// one per test case, with each case's configuration applied using optional variables.
     /// </summary>
     /// <param name="runner">The runner instance.</param>
     /// <param name="baseBuilder">The base execution builder to clone from.</param>
+    /// <param name="variables">The optional variables configuration to pass to each test case.</param>
     /// <param name="cases">The cases to expand.</param>
     /// <returns>The runner instance for fluent chaining.</returns>
     public static Runner AddTestCases(
         this Runner runner,
         ExecutionBuilder baseBuilder,
+        IConfiguration? variables,
         params ITestCase[] cases)
     {
         ArgumentNullException.ThrowIfNull(runner);
@@ -79,7 +82,6 @@ public static class RunnerCaseExpansionExtensions
 
         if (cases == null || cases.Length == 0)
         {
-            // If there are no cases, the base builder itself is added back onto the list to run.
             runner.ExecutionBuilders.Add(baseBuilder);
             return runner;
         }
@@ -88,11 +90,25 @@ public static class RunnerCaseExpansionExtensions
         {
             ArgumentNullException.ThrowIfNull(testCase);
             var caseBuilder = baseBuilder.Clone();
-            caseBuilder.SetCase(testCase.Name);
-            testCase.SetupExecutionBuilder(caseBuilder);
+            caseBuilder.SetCase(testCase.GetType().Name);
+            testCase.ModifyCaseExecutionBuilder(caseBuilder, variables);
             runner.ExecutionBuilders.Add(caseBuilder);
         }
 
         return runner;
     }
+
+    /// <summary>
+    /// Replaces the Runner's existing execution plan with builders cloned from the provided base builder,
+    /// one per test case, without variables.
+    /// </summary>
+    /// <param name="runner">The runner instance.</param>
+    /// <param name="baseBuilder">The base execution builder to clone from.</param>
+    /// <param name="cases">The cases to expand.</param>
+    /// <returns>The runner instance for fluent chaining.</returns>
+    public static Runner AddTestCases(
+        this Runner runner,
+        ExecutionBuilder baseBuilder,
+        params ITestCase[] cases) =>
+        runner.AddTestCases(baseBuilder, variables: null, cases);
 }
