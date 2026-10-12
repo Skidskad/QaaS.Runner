@@ -5,6 +5,9 @@ using QaaS.Framework.SDK.ExecutionObjects;
 using QaaS.Framework.SDK.Hooks.Assertion;
 using QaaS.Runner.Assertions;
 using QaaS.Runner.Assertions.AssertionObjects;
+using QaaS.Runner.Assertions.Reporters;
+using QaaS.Runner.Assertions.Reporters.Allure;
+using QaaS.Runner.Assertions.Reporters.ReportPortal;
 using QaaS.Runner.Logics;
 
 namespace QaaS.Runner.Tests.LogicsTests;
@@ -13,7 +16,7 @@ public class ReportLogicTests
 {
     [TestCase(1)]
     [TestCase(5)]
-    public void TestRun_WithSingleReporterType_WritesMatchingAssertionResults(int assertionCount)
+    public void TestRun_WithSingleReporter_WritesReportableAssertionResults(int assertionCount)
     {
         var reporter = new RecordingReporter();
         var assertionResults = new List<AssertionResult>();
@@ -23,17 +26,17 @@ public class ReportLogicTests
             var assertion = new Assertion
             {
                 Name = $"Assertion{i + 1}",
-                StatussesToReport =
+                StatusesToReport =
                 [
                     AssertionStatus.Broken,
                     AssertionStatus.Failed,
                     AssertionStatus.Passed,
                     AssertionStatus.Skipped,
-                    AssertionStatus.Unknown
+                    AssertionStatus.Unknown,
                 ],
-                ReporterType = typeof(RecordingReporter),
+                ReporterTypes = [typeof(RecordingReporter)],
                 AssertionName = null,
-                AssertionHook = null
+                AssertionHook = null,
             };
             var assertionResult = new AssertionResult
             {
@@ -72,7 +75,7 @@ public class ReportLogicTests
     }
 
     [Test]
-    public void TestRun_WithMultipleReporterTypes_WritesOnlyMatchingAssertions()
+    public void TestRun_WithMultipleReporters_WritesAllReportableAssertionResultsToEachReporter()
     {
         var firstReporter = new RecordingReporter();
         var secondReporter = new AlternateRecordingReporter();
@@ -81,45 +84,48 @@ public class ReportLogicTests
             Assertion = new Assertion
             {
                 Name = "AssertionOne",
-                StatussesToReport =
+                StatusesToReport =
                 [
                     AssertionStatus.Broken,
                     AssertionStatus.Failed,
                     AssertionStatus.Passed,
                     AssertionStatus.Skipped,
-                    AssertionStatus.Unknown
+                    AssertionStatus.Unknown,
                 ],
-                ReporterType = typeof(RecordingReporter),
+                ReporterTypes = [typeof(RecordingReporter), typeof(AlternateRecordingReporter)],
                 AssertionName = null,
-                AssertionHook = null
+                AssertionHook = null,
             },
             AssertionStatus = AssertionStatus.Passed,
             TestDurationMs = 0,
-            Flaky = null
+            Flaky = null,
         };
         var secondAssertionResult = new AssertionResult
         {
             Assertion = new Assertion
             {
                 Name = "AssertionTwo",
-                StatussesToReport =
+                StatusesToReport =
                 [
                     AssertionStatus.Broken,
                     AssertionStatus.Failed,
                     AssertionStatus.Passed,
                     AssertionStatus.Skipped,
-                    AssertionStatus.Unknown
+                    AssertionStatus.Unknown,
                 ],
-                ReporterType = typeof(AlternateRecordingReporter),
+                ReporterTypes = [typeof(RecordingReporter), typeof(AlternateRecordingReporter)],
                 AssertionName = null,
-                AssertionHook = null
+                AssertionHook = null,
             },
             AssertionStatus = AssertionStatus.Passed,
             TestDurationMs = 0,
-            Flaky = null
+            Flaky = null,
         };
 
-        var reportLogic = new ReportLogic([firstReporter, secondReporter], Globals.GetContextWithMetadata());
+        var reportLogic = new ReportLogic(
+            [firstReporter, secondReporter],
+            Globals.GetContextWithMetadata()
+        );
         var executionData = new ExecutionData();
         executionData.AssertionResults.Add(firstAssertionResult);
         executionData.AssertionResults.Add(secondAssertionResult);
@@ -129,9 +135,71 @@ public class ReportLogicTests
         Assert.That(result, Is.SameAs(executionData));
         Assert.Multiple(() =>
         {
-            Assert.That(firstReporter.Results, Is.EqualTo(new[] { firstAssertionResult }));
-            Assert.That(secondReporter.Results, Is.EqualTo(new[] { secondAssertionResult }));
+            Assert.That(
+                firstReporter.Results,
+                Is.EqualTo(new[] { firstAssertionResult, secondAssertionResult })
+            );
+            Assert.That(
+                secondReporter.Results,
+                Is.EqualTo(new[] { firstAssertionResult, secondAssertionResult })
+            );
         });
+    }
+
+    [Test]
+    public void TestRun_WhenAssertionTargetsSpecificReporter_WritesOnlyToMatchingReporterType()
+    {
+        var firstReporter = new RecordingReporter();
+        var secondReporter = new AlternateRecordingReporter();
+        var assertionResult = new AssertionResult
+        {
+            Assertion = new Assertion
+            {
+                Name = "AssertionA",
+                StatusesToReport = [AssertionStatus.Passed],
+                ReporterTypes = [typeof(RecordingReporter)],
+                AssertionName = null,
+                AssertionHook = null,
+            },
+            AssertionStatus = AssertionStatus.Passed,
+            TestDurationMs = 0,
+            Flaky = null,
+        };
+        var executionData = new ExecutionData();
+        executionData.AssertionResults.Add(assertionResult);
+        var logic = new ReportLogic(
+            [firstReporter, secondReporter],
+            Globals.GetContextWithMetadata()
+        );
+
+        var result = logic.Run(executionData);
+
+        Assert.That(result, Is.SameAs(executionData));
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstReporter.Results, Is.EqualTo(new[] { assertionResult }));
+            Assert.That(secondReporter.Results, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Assertion_DefaultReporterTypes_PreserveLegacyReporterTargets()
+    {
+        var assertion = new Assertion();
+
+        Assert.That(
+            assertion.ReporterTypes,
+            Is.EquivalentTo(new[] { typeof(AllureReporter), typeof(ReportPortalReporter) })
+        );
+    }
+
+    [Test]
+    public void ReporterTarget_PublicEnum_RemainsAvailableForCompatibility()
+    {
+        Assert.That(
+            Enum.GetNames<ReporterTarget>(),
+            Is.EquivalentTo(new[] { "Allure", "ReportPortal" })
+        );
     }
 
     [Test]
@@ -143,14 +211,14 @@ public class ReportLogicTests
             Assertion = new Assertion
             {
                 Name = "AssertionA",
-                StatussesToReport = [AssertionStatus.Failed],
-                ReporterType = typeof(RecordingReporter),
+                StatusesToReport = [AssertionStatus.Failed],
+                ReporterTypes = [typeof(RecordingReporter)],
                 AssertionName = null,
-                AssertionHook = null
+                AssertionHook = null,
             },
             AssertionStatus = AssertionStatus.Passed,
             TestDurationMs = 0,
-            Flaky = null
+            Flaky = null,
         };
         var executionData = new ExecutionData();
         executionData.AssertionResults.Add(assertionResult);
@@ -166,9 +234,11 @@ public class ReportLogicTests
     {
         public string Name { get; set; } = nameof(RecordingReporter);
         public string AssertionName { get; set; } = string.Empty;
-        public bool SaveSessionData { get; set; }
-        public bool SaveAttachments { get; set; }
-        public bool DisplayTrace { get; set; }
+        public bool? SaveSessionData { get; set; }
+        public bool? SaveAttachments { get; set; }
+        public bool? SaveLogs { get; set; }
+        public bool? SaveTemplate { get; set; }
+        public bool? DisplayTrace { get; set; }
         public long EpochTestSuiteStartTime { get; set; }
         public List<AssertionResult> Results { get; } = [];
 
@@ -178,7 +248,5 @@ public class ReportLogicTests
         }
     }
 
-    private sealed class AlternateRecordingReporter : RecordingReporter
-    {
-    }
+    private sealed class AlternateRecordingReporter : RecordingReporter { }
 }

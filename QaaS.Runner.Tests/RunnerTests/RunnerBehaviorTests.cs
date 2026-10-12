@@ -11,8 +11,13 @@ using QaaS.Framework.SDK.Extensions;
 using QaaS.Framework.SDK.ExecutionObjects;
 using QaaS.Framework.SDK.Session.SessionDataObjects;
 using QaaS.Framework.SDK.Session.SessionDataObjects.RunningSessionsObjects;
+using QaaS.Runner.Assertions;
 using QaaS.Runner.WrappedExternals;
 using Allure.Commons;
+using QaaS.Runner.Assertions.Reporters;
+using QaaS.Runner.Assertions.ConfigurationObjects.ReporterConfigs;
+using QaaS.Runner.Assertions.Reporters.ReportPortal;
+using QaaS.Runner.Logics;
 
 namespace QaaS.Runner.Tests.RunnerTests;
 
@@ -85,42 +90,112 @@ public class RunnerBehaviorTests
         }
     }
 
-    private sealed class NonExitingRunLifecycleRunner(
+    private sealed class CommandAwareGateRunner(
+        ILifetimeScope scope,
+        List<ExecutionBuilder> executionBuilders,
+        Microsoft.Extensions.Logging.ILogger logger,
+        Serilog.ILogger serilogLogger,
+        List<Execution> executions) : Runner(scope, executionBuilders, logger, serilogLogger)
+    {
+        protected override void Setup()
+        {
+        }
+
+        protected override List<Execution> BuildExecutions() => executions;
+
+        protected override void Teardown()
+        {
+        }
+    }
+
+    private sealed class RecordingExecution(
+        ExecutionType type,
+        InternalContext context,
+        string name,
+        IList<string> calls) : Execution(type, context)
+    {
+        public override int Start()
+        {
+            calls.Add($"start-{name}");
+            return 0;
+        }
+    }
+
+    private sealed class PublishOrderRunner(
         ILifetimeScope scope,
         List<ExecutionBuilder> executionBuilders,
         Microsoft.Extensions.Logging.ILogger logger,
         Serilog.ILogger serilogLogger) : Runner(scope, executionBuilders, logger, serilogLogger)
     {
         public List<string> Calls { get; } = [];
-        public int? ExitCode { get; private set; }
-        public int? ProcessExitCode { get; private set; }
+        public string? TerminalOutputPathAtPublish { get; private set; }
 
         protected override void Setup() => Calls.Add("setup");
 
         protected override List<Execution> BuildExecutions()
         {
             Calls.Add("build");
-            return [];
+            return [CreateRecordingExecution(ExecutionType.Run, "run", [], reportPortalEnabled: true)];
         }
 
         protected override int StartExecutions(List<Execution> executions)
         {
             Calls.Add("start");
-            return 5;
+            return base.StartExecutions(executions);
         }
 
-        protected override void Teardown() => Calls.Add("teardown");
-
-        protected override void ExitProcess(int exitCode)
+        protected override void PublishReportPortalResults(IEnumerable<Execution>? executions)
         {
-            Calls.Add("exit");
-            ExitCode = exitCode;
+            TerminalOutputPathAtPublish = ReportPortalPublisher.TerminalOutputPath;
+            Calls.Add("publish-reportportal");
         }
 
-        protected override void SetProcessExitCode(int exitCode)
+        protected override void DisposeExecutions(IEnumerable<Execution>? executions)
         {
-            Calls.Add("set-exit-code");
-            ProcessExitCode = exitCode;
+            Calls.Add("dispose-executions");
+        }
+
+        protected override void Teardown()
+        {
+            Calls.Add("teardown");
+        }
+
+        public override void Dispose()
+        {
+            Calls.Add("dispose");
+            base.Dispose();
+        }
+    }
+
+    private sealed class RecordingReportPortalPublisher(
+        Exception? validationException = null,
+        IList<string>? executionCalls = null)
+        : ReportPortalPublisher(Globals.Logger)
+    {
+        private readonly Exception? _validationException = validationException;
+        public List<string> Calls { get; } = [];
+        public int ValidatedReporterCount { get; private set; }
+        public (string Path, string Text)? CapturedTerminalOutput { get; private set; }
+
+        public override Task ValidateAsync(IEnumerable<ReportPortalReporter> reporters,
+            CancellationToken cancellationToken = default)
+        {
+            Calls.Add("validate");
+            executionCalls?.Add("validate");
+            ValidatedReporterCount = reporters.Count();
+            if (_validationException is not null)
+                throw _validationException;
+
+            return Task.CompletedTask;
+        }
+
+        public override Task PublishAsync(IEnumerable<ReportPortalReporter> reporters,
+            CancellationToken cancellationToken = default)
+        {
+            Calls.Add("publish");
+            if (TerminalOutputPath is not null)
+                CapturedTerminalOutput = (TerminalOutputPath, File.ReadAllText(TerminalOutputPath));
+            return Task.CompletedTask;
         }
     }
 
@@ -138,25 +213,6 @@ public class RunnerBehaviorTests
         protected override void ServeResultsInAllure()
         {
             ServedResults = true;
-        }
-    }
-
-    private sealed class AllureSpyWrapper : AllureWrapper
-    {
-        public bool CleanCalled { get; private set; }
-        public bool ServeCalled { get; private set; }
-        public string? ServedResultsDirectoryName { get; private set; }
-
-        public override void CleanTestResultsDirectory()
-        {
-            CleanCalled = true;
-        }
-
-        public override void ServeTestResults(string allureRunnablePath = DefaultAllureRunnablePath,
-            string? resultsDirectoryName = null)
-        {
-            ServeCalled = true;
-            ServedResultsDirectoryName = resultsDirectoryName;
         }
     }
 
@@ -428,20 +484,6 @@ public class RunnerBehaviorTests
     }
 
     [Test]
-    public void Teardown_WithLoggerDisposalDisabled_DoesNotDisposeSerilogLogger()
-    {
-        using var scope = BuildScope();
-        var serilogLogger = new Mock<Serilog.ILogger>();
-        var disposableLogger = serilogLogger.As<IDisposable>();
-        var runner = new ExposedRunner(scope, [], Globals.Logger, serilogLogger.Object);
-        runner.WithSerilogLoggerDisposal(false);
-
-        runner.InvokeTeardown();
-
-        disposableLogger.Verify(logger => logger.Dispose(), Times.Never);
-    }
-
-    [Test]
     public void Teardown_WithServeResultsEnabled_InvokesServeResultsHook()
     {
         using var scope = BuildScope();
@@ -450,35 +492,6 @@ public class RunnerBehaviorTests
         runner.InvokeTeardown();
 
         Assert.That(runner.ServedResults, Is.True);
-    }
-
-    [Test]
-    public void Teardown_BaseImplementation_UsesAllureWrapperFromScopeWhenServingResults()
-    {
-        var allureWrapper = new AllureSpyWrapper();
-        using var scope = BuildScope(allureWrapper);
-        var runner = new ExposedRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object,
-            serveResults: true);
-        runner.WithServeResultsFolder("allure-report");
-
-        runner.InvokeTeardown();
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(allureWrapper.ServeCalled, Is.True);
-            Assert.That(allureWrapper.ServedResultsDirectoryName, Is.EqualTo("allure-report"));
-        });
-    }
-
-    [Test]
-    public void Teardown_WithServeResultsDisabled_DoesNotInvokeServeResultsHook()
-    {
-        using var scope = BuildScope();
-        var runner = new ServeResultsRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object, serveResults: false);
-
-        runner.InvokeTeardown();
-
-        Assert.That(runner.ServedResults, Is.False);
     }
 
     [Test]
@@ -515,7 +528,7 @@ public class RunnerBehaviorTests
 
         Assert.That(executions, Has.Count.EqualTo(2));
 
-        var executionTypeProperty = typeof(Execution).GetProperty("Type", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        var executionTypeProperty = typeof(Execution).GetProperty("Type", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.That(executions.Select(execution => executionTypeProperty!.GetValue(execution)),
             Is.All.EqualTo(ExecutionType.Template));
     }
@@ -639,138 +652,207 @@ public class RunnerBehaviorTests
     }
 
     [Test]
-    public void StartExecutions_WithNoExecutions_ReturnsZero()
+    public void BuildExecutions_DoesNotAssignReportPortalRuntimeStateToBuilders()
     {
         using var scope = BuildScope();
-        var runner = new ExposedRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
-
-        var result = runner.InvokeStartExecutions([]);
-
-        Assert.That(result, Is.Zero);
-    }
-
-    [Test]
-    public void Run_InvokesLifecycleInOrder_AndPassesExitCode()
-    {
-        using var scope = BuildScope();
-        var runner = new RunLifecycleRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
-
-        runner.Run();
-
-        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "teardown", "exit" }));
-        Assert.That(runner.ExitCode, Is.EqualTo(7));
-    }
-
-    [Test]
-    public void Run_WhenProcessExitIsDisabled_SetsProcessExitCodeWithoutCallingExit()
-    {
-        using var scope = BuildScope();
-        var runner = new NonExitingRunLifecycleRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object)
+        var builders = new List<ExecutionBuilder>
         {
-            ExitProcessOnCompletion = false
+            CreateTemplateExecutionBuilder("case-1", reportPortalEnabled: true),
+            CreateTemplateExecutionBuilder("case-2", reportPortalEnabled: true)
         };
 
-        runner.Run();
+        var runner = new ExposedRunner(scope, builders, Globals.Logger, new Mock<Serilog.ILogger>().Object);
+        _ = runner.InvokeBuildExecutions();
 
-        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "teardown", "set-exit-code" }));
-        Assert.That(runner.ProcessExitCode, Is.EqualTo(5));
-        Assert.That(runner.ExitCode, Is.Null);
-        Assert.That(runner.LastExitCode, Is.EqualTo(5));
+        var reportPortalRuntimeFields = typeof(ExecutionBuilder)
+            .GetFields(BindingFlags.Instance | BindingFlags.NonPublic)
+            .Where(field =>
+                field.Name.Contains("reportPortal", StringComparison.OrdinalIgnoreCase) &&
+                !field.FieldType.IsAssignableTo(typeof(Delegate)))
+            .Select(field => field.Name)
+            .ToArray();
+
+        Assert.That(reportPortalRuntimeFields, Is.Empty);
     }
 
     [Test]
-    public void RunAndGetExitCode_ReturnsExitCodeWithoutCallingProcessExitHooks()
+    [NonParallelizable]
+    public void RunAndGetExitCode_WhenReportPortalValidationFails_ReturnsFailureExitCodeBeforeStart()
     {
         using var scope = BuildScope();
-        var runner = new NonExitingRunLifecycleRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
-
-        var exitCode = runner.RunAndGetExitCode();
-
-        Assert.That(exitCode, Is.EqualTo(5));
-        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "teardown" }));
-        Assert.That(runner.ProcessExitCode, Is.Null);
-        Assert.That(runner.ExitCode, Is.Null);
-        Assert.That(runner.LastExitCode, Is.EqualTo(5));
-    }
-
-    [Test]
-    public void RunAndGetExitCode_WhenBootstrapAlreadyHandled_SkipsLifecycleAndDisposesResources()
-    {
-        using var scope = BuildScope();
-        var serilogLogger = new Mock<Serilog.ILogger>();
-        var disposableLogger = serilogLogger.As<IDisposable>();
-        var runner = Bootstrap.CreateRunner<BootstrapHandledRunner>(scope, [], Globals.Logger, serilogLogger.Object);
-        runner.WithBootstrapHandledExitCode(12);
+        var calls = new List<string>();
+        var publisher = new RecordingReportPortalPublisher(
+            new InvalidConfigurationsException("ReportPortal validation failed"), calls);
+        var execution = CreateRecordingExecution(ExecutionType.Run, "run", calls, reportPortalEnabled: true);
+        var runner = new CommandAwareGateRunner(scope, [], Globals.Logger,
+            new Mock<Serilog.ILogger>().Object, [execution])
+        {
+            ReportPortalPublisher = publisher
+        };
 
         var exitCode = runner.RunAndGetExitCode();
 
         Assert.Multiple(() =>
         {
-            Assert.That(exitCode, Is.EqualTo(12));
-            Assert.That(runner.Calls, Is.EqualTo(new[] { "dispose" }));
-            Assert.That(runner.LastExitCode, Is.EqualTo(12));
+            Assert.That(exitCode, Is.EqualTo(1));
+            Assert.That(calls, Is.EqualTo(new[] { "validate" }));
+            Assert.That(publisher.Calls, Is.EqualTo(new[] { "validate", "publish" }));
+            Assert.That(runner.LastExitCode, Is.EqualTo(1));
         });
-        disposableLogger.Verify(logger => logger.Dispose(), Times.Once);
     }
 
     [Test]
-    public void RunAndGetExitCode_WhenBootstrapAlreadyHandled_RespectsDisabledSerilogDisposal()
+    public void RunAndGetExitCode_WithMixedCommands_ValidatesImmediatelyBeforeFirstReportingExecution()
     {
         using var scope = BuildScope();
-        var serilogLogger = new Mock<Serilog.ILogger>();
-        var disposableLogger = serilogLogger.As<IDisposable>();
-        var runner = Bootstrap.CreateRunner<BootstrapHandledRunner>(scope, [], Globals.Logger, serilogLogger.Object);
-        runner.WithSerilogLoggerDisposal(false)
-            .WithBootstrapHandledExitCode(2);
+        var calls = new List<string>();
+        var executions = new List<Execution>
+        {
+            CreateRecordingExecution(ExecutionType.Template, "template", calls),
+            CreateRecordingExecution(ExecutionType.Act, "act", calls),
+            CreateRecordingExecution(ExecutionType.Run, "run", calls, reportPortalEnabled: true),
+            CreateRecordingExecution(ExecutionType.Assert, "assert", calls, reportPortalEnabled: true)
+        };
+        var publisher = new RecordingReportPortalPublisher(executionCalls: calls);
+        var runner = new CommandAwareGateRunner(scope, [], Globals.Logger,
+            new Mock<Serilog.ILogger>().Object, executions)
+        {
+            ReportPortalPublisher = publisher
+        };
 
         var exitCode = runner.RunAndGetExitCode();
 
-        Assert.That(exitCode, Is.EqualTo(2));
-        disposableLogger.Verify(logger => logger.Dispose(), Times.Never);
-    }
-
-    [Test]
-    public void ExitProcess_UsesProcessExitHandler()
-    {
-        using var scope = BuildScope();
-        var runner = new BaseExitRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
-        var originalExitHandler = Runner.ProcessExitHandler;
-        int? capturedExitCode = null;
-
-        try
+        Assert.Multiple(() =>
         {
-            Runner.ProcessExitHandler = exitCode => capturedExitCode = exitCode;
+            Assert.That(exitCode, Is.Zero);
+            Assert.That(publisher.ValidatedReporterCount, Is.EqualTo(2));
+            Assert.That(calls, Is.EqualTo(new[]
+            {
+                "start-template",
+                "start-act",
+                "validate",
+                "start-run",
+                "start-assert"
+            }));
+        });
+    }
 
-            runner.InvokeBaseExitProcess(9);
-
-            Assert.That(capturedExitCode, Is.EqualTo(9));
-        }
-        finally
+    [Test]
+    public void RunAndGetExitCode_WhenMixedCommandValidationFails_StopsAtFirstReportingExecution()
+    {
+        using var scope = BuildScope();
+        var calls = new List<string>();
+        var executions = new List<Execution>
         {
-            Runner.ProcessExitHandler = originalExitHandler;
-        }
+            CreateRecordingExecution(ExecutionType.Template, "template", calls),
+            CreateRecordingExecution(ExecutionType.Act, "act", calls),
+            CreateRecordingExecution(ExecutionType.Run, "run", calls, reportPortalEnabled: true),
+            CreateRecordingExecution(ExecutionType.Template, "later-template", calls)
+        };
+        var publisher = new RecordingReportPortalPublisher(
+            new InvalidConfigurationsException("ReportPortal validation failed"), calls);
+        var runner = new CommandAwareGateRunner(scope, [], Globals.Logger,
+            new Mock<Serilog.ILogger>().Object, executions)
+        {
+            ReportPortalPublisher = publisher
+        };
+
+        var exitCode = runner.RunAndGetExitCode();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exitCode, Is.EqualTo(1));
+            Assert.That(calls, Is.EqualTo(new[]
+            {
+                "start-template",
+                "start-act",
+                "validate"
+            }));
+        });
     }
 
     [Test]
-    public void Run_WhenBuildExecutionsThrows_StillRunsTeardownAndDispose()
+    [NonParallelizable]
+    public void RunAndGetExitCode_PublishesReportPortalResultsBeforeDisposingExecutions()
     {
         using var scope = BuildScope();
-        var runner = new FailingBuildRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
+        var originalOut = Console.Out;
+        var originalError = Console.Error;
+        var runner = new PublishOrderRunner(scope,
+            [CreateExecutionBuilder(ExecutionType.Run, "case", reportPortalEnabled: true)], Globals.Logger,
+            new Mock<Serilog.ILogger>().Object)
+        {
+            ReportPortalPublisher = new RecordingReportPortalPublisher()
+        };
 
-        Assert.Throws<InvalidOperationException>(() => runner.Run());
+        var exitCode = runner.RunAndGetExitCode();
 
-        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "teardown", "dispose" }));
-        Assert.That(runner.Disposed, Is.True);
-        Assert.That(runner.LastExitCode, Is.Null);
+        Assert.That(exitCode, Is.Zero);
+        Assert.That(runner.TerminalOutputPathAtPublish, Is.Not.Null);
+        Assert.That(File.Exists(runner.TerminalOutputPathAtPublish), Is.False);
+        Assert.That(Console.Out, Is.SameAs(originalOut));
+        Assert.That(Console.Error, Is.SameAs(originalError));
+        Assert.That(runner.Calls,
+            Is.EqualTo(new[]
+            {
+                "setup",
+                "build",
+                "start",
+                "publish-reportportal",
+                "dispose-executions",
+                "teardown",
+                "dispose"
+            }));
+    }
+
+    [TestCase(ExecutionType.Template)]
+    [TestCase(ExecutionType.Act)]
+    [NonParallelizable]
+    public void RunAndGetExitCode_WithNonReportingCommand_DoesNotUseReportPortal(ExecutionType executionType)
+    {
+        using var scope = BuildScope();
+        var calls = new List<string>();
+        var publisher = new RecordingReportPortalPublisher();
+        var execution = CreateRecordingExecution(executionType, executionType.ToString(), calls);
+        var runner = new CommandAwareGateRunner(scope,
+            [CreateExecutionBuilder(executionType, "case", reportPortalEnabled: true)], Globals.Logger,
+            new Mock<Serilog.ILogger>().Object, [execution])
+        {
+            ReportPortalPublisher = publisher
+        };
+
+        var exitCode = runner.RunAndGetExitCode();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exitCode, Is.Zero);
+            Assert.That(calls, Is.EqualTo(new[] { $"start-{executionType}" }));
+            Assert.That(publisher.Calls, Is.Empty);
+            Assert.That(publisher.TerminalOutputPath, Is.Null);
+        });
     }
 
     [Test]
-    public void RunAndGetExitCode_WhenBuildExecutionsThrows_RethrowsLifecycleFailure()
+    public void RunAndGetExitCode_WithDisabledReportPortal_DoesNotValidateOrPublish()
     {
         using var scope = BuildScope();
-        var runner = new FailingBuildRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
+        var calls = new List<string>();
+        var publisher = new RecordingReportPortalPublisher();
+        var execution = CreateRecordingExecution(ExecutionType.Run, "run", calls);
+        var runner = new CommandAwareGateRunner(scope, [CreateExecutionBuilder(ExecutionType.Run, "case")],
+            Globals.Logger, new Mock<Serilog.ILogger>().Object, [execution])
+        {
+            ReportPortalPublisher = publisher
+        };
 
-        Assert.Throws<InvalidOperationException>(() => runner.RunAndGetExitCode());
+        var exitCode = runner.RunAndGetExitCode();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exitCode, Is.Zero);
+            Assert.That(calls, Is.EqualTo(new[] { "start-run" }));
+            Assert.That(publisher.Calls, Is.Empty);
+        });
     }
 
     [Test]
@@ -817,111 +899,44 @@ public class RunnerBehaviorTests
     }
 
     [Test]
-    public void RunAndGetExitCode_WhenStartExecutionsThrows_DisposesBuiltExecutionsAndRethrowsFailure()
-    {
-        using var scope = BuildScope();
-        var context = CreateContext();
-        var execution = new Mock<Execution>(ExecutionType.Run, context);
-        var startFailure = new InvalidOperationException("start failed");
-        var runner = new FailingStartRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object,
-            [execution.Object], startFailure);
-
-        var exception = Assert.Throws<InvalidOperationException>(() => runner.RunAndGetExitCode());
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(exception, Is.SameAs(startFailure));
-            Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "dispose-executions", "teardown", "dispose" }));
-            Assert.That(runner.LastExitCode, Is.Null);
-        });
-        execution.Verify(currentExecution => currentExecution.Dispose(), Times.Once);
-    }
-
-    [Test]
-    public void RunAndGetExitCode_WhenCleanupFailsAfterSuccessfulLifecycle_ThrowsCleanupFailure()
-    {
-        using var scope = BuildScope();
-        var teardownFailure = new InvalidOperationException("teardown failed");
-        var runner = new CleanupFailureRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object,
-            teardownException: teardownFailure);
-
-        var exception = Assert.Throws<InvalidOperationException>(() => runner.RunAndGetExitCode());
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(exception, Is.SameAs(teardownFailure));
-            Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "dispose-executions", "teardown", "dispose" }));
-            Assert.That(runner.LastExitCode, Is.EqualTo(0));
-        });
-    }
-
-    [Test]
-    public void RunAndGetExitCode_WhenLifecycleAndCleanupFail_ThrowsAggregateException()
-    {
-        using var scope = BuildScope();
-        var lifecycleFailure = new InvalidOperationException("build failed");
-        var teardownFailure = new InvalidOperationException("teardown failed");
-        var disposeFailure = new InvalidOperationException("dispose failed");
-        var runner = new CleanupFailureRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object,
-            lifecycleException: lifecycleFailure,
-            teardownException: teardownFailure,
-            disposeException: disposeFailure);
-
-        var exception = Assert.Throws<AggregateException>(() => runner.RunAndGetExitCode());
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(exception!.InnerExceptions, Is.EqualTo(new[] { lifecycleFailure, teardownFailure, disposeFailure }));
-            Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "dispose-executions", "teardown", "dispose" }));
-            Assert.That(runner.LastExitCode, Is.Null);
-        });
-    }
-
-    [Test]
-    public void RunAndGetExitCode_WhenMultipleCleanupStepsFail_AggregatesCleanupFailures()
-    {
-        using var scope = BuildScope();
-        var disposeExecutionsFailure = new InvalidOperationException("dispose-executions failed");
-        var teardownFailure = new InvalidOperationException("teardown failed");
-        var runner = new CleanupFailureRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object,
-            disposeExecutionsException: disposeExecutionsFailure,
-            teardownException: teardownFailure);
-
-        var exception = Assert.Throws<AggregateException>(() => runner.RunAndGetExitCode());
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(exception!.InnerExceptions, Is.EqualTo(new[] { disposeExecutionsFailure, teardownFailure }));
-            Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "dispose-executions", "teardown", "dispose" }));
-            Assert.That(runner.LastExitCode, Is.EqualTo(0));
-        });
-    }
-
-    [Test]
-    public void Dispose_WhenCalledTwice_DisposesScopeOnlyOnce()
+    public void StartExecutions_WithNoExecutions_ReturnsZero()
     {
         using var scope = BuildScope();
         var runner = new ExposedRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
 
-        Assert.DoesNotThrow(() =>
-        {
-            runner.Dispose();
-            runner.Dispose();
-        });
+        var result = runner.InvokeStartExecutions([]);
+
+        Assert.That(result, Is.Zero);
     }
 
-    private static ILifetimeScope BuildScope(AllureWrapper? allureWrapper = null)
+    [Test]
+    public void Run_InvokesLifecycleInOrder_AndPassesExitCode()
+    {
+        using var scope = BuildScope();
+        var runner = new RunLifecycleRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
+
+        runner.Run();
+
+        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "start", "teardown", "exit" }));
+        Assert.That(runner.ExitCode, Is.EqualTo(7));
+    }
+
+    [Test]
+    public void Run_WhenBuildExecutionsThrows_StillRunsTeardownAndDispose()
+    {
+        using var scope = BuildScope();
+        var runner = new FailingBuildRunner(scope, [], Globals.Logger, new Mock<Serilog.ILogger>().Object);
+
+        Assert.Throws<InvalidOperationException>(() => runner.Run());
+
+        Assert.That(runner.Calls, Is.EqualTo(new[] { "setup", "build", "teardown", "dispose" }));
+        Assert.That(runner.Disposed, Is.True);
+    }
+
+    private static ILifetimeScope BuildScope()
     {
         var builder = new ContainerBuilder();
-        if (allureWrapper == null)
-        {
-            builder.RegisterType<AllureWrapper>().SingleInstance();
-        }
-        else
-        {
-            builder.RegisterInstance(allureWrapper).As<AllureWrapper>().SingleInstance();
-        }
-
+        builder.RegisterType<AllureWrapper>().SingleInstance();
         return builder.Build().BeginLifetimeScope();
     }
 
@@ -934,7 +949,24 @@ public class RunnerBehaviorTests
         return markerFile;
     }
 
-    private static ExecutionBuilder CreateTemplateExecutionBuilder(string caseName, IConfiguration? rootConfiguration = null)
+    private static ExecutionBuilder CreateTemplateExecutionBuilder(
+        string caseName,
+        IConfiguration? rootConfiguration = null,
+        string team = "Smoke",
+        string system = "QaaS",
+        bool reportPortalEnabled = false)
+    {
+        return CreateExecutionBuilder(ExecutionType.Template, caseName, rootConfiguration, team, system,
+            reportPortalEnabled);
+    }
+
+    private static ExecutionBuilder CreateExecutionBuilder(
+        ExecutionType executionType,
+        string caseName,
+        IConfiguration? rootConfiguration = null,
+        string team = "Smoke",
+        string system = "QaaS",
+        bool reportPortalEnabled = false)
     {
         var context = new InternalContext
         {
@@ -946,18 +978,53 @@ public class RunnerBehaviorTests
         };
         context.InsertValueIntoGlobalDictionary(context.GetMetaDataPath(), new MetaDataConfig
         {
-            Team = "Smoke",
-            System = "QaaS"
+            Team = team,
+            System = system
         });
 
-        return new ExecutionBuilder(context, ExecutionType.Template, null, null, null, null)
+        var builder = new ExecutionBuilder(context, executionType, null, null, null, null)
             .SetExecutionId($"exec-{caseName}")
             .SetCase(caseName)
             .WithMetadata(new MetaDataConfig
             {
-                Team = "Smoke",
-                System = "QaaS"
+                Team = team,
+                System = system
             });
+
+        if (reportPortalEnabled)
+            builder.Reporters!.ConfigureReportPortal(new ReportPortalConfig { Enabled = true });
+
+        return builder;
+    }
+
+    private static Execution CreateRecordingExecution(
+        ExecutionType executionType,
+        string name,
+        IList<string> calls,
+        bool reportPortalEnabled = false)
+    {
+        var context = CreateContext();
+        var reporters = reportPortalEnabled
+            ? new List<IReporter>
+            {
+                new ReportPortalReporter
+                {
+                    Context = context,
+                    Config = new ReportPortalConfig
+                    {
+                        Enabled = true,
+                        Endpoint = "https://reportportal.example/api/",
+                        ApiKey = "api-key",
+                        Project = "project"
+                    }
+                }
+            }
+            : [];
+
+        return new RecordingExecution(executionType, context, name, calls)
+        {
+            ReportLogic = new ReportLogic(reporters, context)
+        };
     }
 
     private static InternalContext CreateContext()

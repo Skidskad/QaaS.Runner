@@ -3,7 +3,9 @@ using Autofac;
 using Microsoft.Extensions.Logging;
 using QaaS.Framework.Configurations.CustomExceptions;
 using QaaS.Framework.Executions;
+using QaaS.Runner.Output;
 using QaaS.Runner.Options;
+using QaaS.Runner.Assertions.Reporters.ReportPortal;
 using QaaS.Runner.WrappedExternals;
 using ILogger = Microsoft.Extensions.Logging.ILogger;
 
@@ -26,6 +28,8 @@ public class Runner : IRunner, IDisposable
     private string ServeResultsFolder { get; set; } = AssertableOptions.DefaultServeResultsFolder;
     private bool DisposeSerilogLogger { get; set; } = true;
     private int? BootstrapHandledExitCode { get; set; }
+    internal ReportPortalPublisher ReportPortalPublisher { get; set; }
+    private TerminalOutputCapture? _terminalOutput;
 
     /// <summary>
     /// Controls whether <see cref="Run" /> terminates the current process after the runner finishes successfully.
@@ -66,6 +70,7 @@ public class Runner : IRunner, IDisposable
         Scope = scope;
         EmptyResults = emptyResults;
         ServeResults = serveResults;
+        ReportPortalPublisher = new ReportPortalPublisher(logger);
     }
 
     /// <summary>
@@ -132,6 +137,7 @@ public class Runner : IRunner, IDisposable
     protected virtual void Teardown()
     {
         Logger.LogDebug("Runner teardown started");
+
         if (DisposeSerilogLogger && SerilogLogger is IDisposable disposableLogger)
         {
             Logger.LogDebug("Disposing Serilog logger instance");
@@ -204,23 +210,76 @@ public class Runner : IRunner, IDisposable
         // The logger is also assigned directly because execution builders are plain mutable configuration objects,
         // not services resolved from the Autofac scope.
         ExecutionBuilders.ForEach(builder => builder.WithLogger(Logger));
+
         var executions = ExecutionBuilders.Select(builder => builder.Build()).ToList();
         Logger.LogInformation("Built {ExecutionCount} executions successfully", executions.Count);
         return executions;
     }
 
     /// <summary>
-    /// Starts each materialized execution and returns the aggregated exit code.
+    /// Starts materialized executions in order and returns their aggregated exit code.
     /// </summary>
     /// <param name="executions">The executions to run.</param>
     /// <returns>The sum of the individual execution exit codes.</returns>
     protected virtual int StartExecutions(List<Execution> executions)
     {
         Logger.LogInformation("Running {ExecutionCount} executions", executions.Count);
-        var exitCode = executions.Select(execution => execution.Start()).Sum();
+
+        var reporters = GetReportPortalReporters(executions);
+        var exitCode = 0;
+        foreach (var execution in executions)
+        {
+            PrepareReportPortal(execution, reporters);
+            exitCode += execution.Start();
+        }
+
         Logger.LogInformation("Finished running executions. Aggregated exit code: {ExitCode}", exitCode);
         return exitCode;
     }
+
+    /// <summary>
+    /// Validates and initializes ReportPortal before its first reporting execution.
+    /// </summary>
+    /// <param name="execution">The execution about to start.</param>
+    /// <param name="reporters">The pending ReportPortal reporters.</param>
+    private void PrepareReportPortal(Execution execution, List<ReportPortalReporter> reporters)
+    {
+        if (reporters.Count == 0 || !HasReportPortal(execution))
+            return;
+
+        ReportPortalPublisher.ValidateAsync(reporters).GetAwaiter().GetResult();
+        if (reporters.Any(reporter => reporter.SaveTerminalOutput != false))
+            _terminalOutput = TerminalOutputCapture.TryStart(Logger);
+
+        reporters.Clear();
+    }
+
+    /// <summary>
+    /// Returns whether an execution contains a ReportPortal reporter.
+    /// </summary>
+    /// <param name="execution">The execution to inspect.</param>
+    /// <returns><see langword="true" /> when ReportPortal reporting is configured.</returns>
+    private static bool HasReportPortal(Execution execution) =>
+        execution.ReportLogic?.Reporters.Any(reporter => reporter is ReportPortalReporter) == true;
+
+    /// <summary>
+    /// Publishes queued ReportPortal assertion results after execution and before execution scopes are disposed.
+    /// </summary>
+    /// <param name="executions">The executions whose ReportPortal reporters may have queued assertion results.</param>
+    protected virtual void PublishReportPortalResults(IEnumerable<Execution>? executions)
+    {
+        var reporters = GetReportPortalReporters(executions);
+        if (reporters.Count == 0)
+            return;
+
+        ReportPortalPublisher.PublishAsync(reporters).GetAwaiter().GetResult();
+    }
+
+    private static List<ReportPortalReporter> GetReportPortalReporters(IEnumerable<Execution>? executions) =>
+        (executions ?? [])
+            .SelectMany(execution => execution.ReportLogic?.Reporters ?? [])
+            .OfType<ReportPortalReporter>()
+            .ToList();
 
     /// <summary>
     /// Disposes the provided executions in deterministic enumeration order.
@@ -247,6 +306,7 @@ public class Runner : IRunner, IDisposable
             return;
 
         _disposed = true;
+        ReportPortalPublisher.Dispose();
         Logger.LogDebug("Disposing runner scope");
         Scope.Dispose();
         GC.SuppressFinalize(this);
@@ -285,6 +345,17 @@ public class Runner : IRunner, IDisposable
         if (!string.IsNullOrWhiteSpace(serveResultsFolder))
             ServeResultsFolder = serveResultsFolder.Trim();
 
+        return this;
+    }
+
+    /// <summary>
+    /// Controls whether successfully published ReportPortal reports open in the default browser.
+    /// </summary>
+    /// <param name="openReportPortal"><see langword="true" /> to open each published report.</param>
+    /// <returns>The current runner instance for fluent configuration.</returns>
+    internal Runner WithOpenReportPortal(bool openReportPortal)
+    {
+        ReportPortalPublisher.OpenReportPortal = openReportPortal;
         return this;
     }
 
@@ -363,7 +434,6 @@ public class Runner : IRunner, IDisposable
     {
         ExecuteLifecyclePhase(RunnerLifecyclePhase.Setup, Setup);
         lifecycleState.Executions = ExecuteLifecyclePhase(RunnerLifecyclePhase.BuildExecutions, BuildExecutions);
-
         var exitCode = ExecuteLifecyclePhase(RunnerLifecyclePhase.StartExecutions,
             () => StartExecutions(lifecycleState.Executions!));
         LastExitCode = exitCode;
@@ -444,12 +514,29 @@ public class Runner : IRunner, IDisposable
         Logger.LogDebug("Runner cleanup started");
 
         var cleanupFailures = new List<Exception>();
+        RunCleanupStep("publish ReportPortal results", () => PublishReportPortalResultsWithCleanup(executions), cleanupFailures);
         RunCleanupStep("dispose executions", () => DisposeExecutions(executions), cleanupFailures);
         RunCleanupStep("teardown", Teardown, cleanupFailures);
         RunCleanupStep("dispose runner", Dispose, cleanupFailures);
 
         Logger.LogDebug("Runner cleanup completed. FailureCount={FailureCount}", cleanupFailures.Count);
         return cleanupFailures;
+    }
+
+    /// <summary>
+    /// Publishes ReportPortal results and completes the associated cleanup.
+    /// </summary>
+    /// <param name="executions">The completed executions whose queued results should be published.</param>
+    private void PublishReportPortalResultsWithCleanup(IEnumerable<Execution>? executions)
+    {
+        _terminalOutput?.Stop();
+        ReportPortalPublisher.TerminalOutputPath = _terminalOutput?.Path;
+        try { PublishReportPortalResults(executions); }
+        finally
+        {
+            _terminalOutput?.Dispose();
+            _terminalOutput = null;
+        }
     }
 
     /// <summary>

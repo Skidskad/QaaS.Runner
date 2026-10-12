@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using NUnit.Framework;
 using QaaS.Framework.SDK.ContextObjects;
 using QaaS.Framework.SDK.Session.CommunicationDataObjects;
@@ -11,8 +12,8 @@ using QaaS.Framework.SDK.Session.SessionDataObjects.RunningSessionsObjects;
 using QaaS.Framework.Serialization;
 using QaaS.Runner.Sessions.Extensions;
 using QaaS.Runner.Sessions.Tests.Actions.Utils;
-using SessionAction = QaaS.Runner.Sessions.Actions.Action;
 using InternalCommunicationData = QaaS.Runner.Sessions.Actions.InternalCommunicationData<object>;
+using SessionAction = QaaS.Runner.Sessions.Actions.Action;
 
 namespace QaaS.Runner.Sessions.Tests.Extensions;
 
@@ -26,7 +27,9 @@ public class SessionExtensionsTests
     {
         IEnumerable<DisposableTracker>? disposables = null;
 
-        Assert.DoesNotThrow(() => disposables.DisposeOfEnumerable("DisposableTracker", Globals.Logger));
+        Assert.DoesNotThrow(() =>
+            disposables.DisposeOfEnumerable("DisposableTracker", Globals.Logger)
+        );
     }
 
     [Test]
@@ -47,8 +50,14 @@ public class SessionExtensionsTests
     {
         var failures = new List<ActionFailure>();
 
-        failures.AppendActionFailure(new InvalidOperationException("Action failed"), SessionName, Globals.Logger,
-            "Publisher", "PublishAction", "Kafka");
+        failures.AppendActionFailure(
+            new InvalidOperationException("Action failed"),
+            SessionName,
+            Globals.Logger,
+            "Publisher",
+            "PublishAction",
+            "Kafka"
+        );
 
         Assert.That(failures, Has.Count.EqualTo(1));
         Assert.That(failures[0].Name, Is.EqualTo("PublishAction"));
@@ -61,8 +70,13 @@ public class SessionExtensionsTests
     {
         var failures = new List<ActionFailure>();
 
-        failures.AppendActionFailure(new InvalidOperationException("No protocol"), SessionName, Globals.Logger,
-            "Collector", "CollectAction");
+        failures.AppendActionFailure(
+            new InvalidOperationException("No protocol"),
+            SessionName,
+            Globals.Logger,
+            "Collector",
+            "CollectAction"
+        );
 
         Assert.That(failures, Has.Count.EqualTo(1));
         Assert.That(failures[0].Name, Is.EqualTo("CollectAction"));
@@ -81,30 +95,336 @@ public class SessionExtensionsTests
             "Consumer",
             "ConsumeAction",
             actionProtocol: "Kafka",
-            exceptionMessage: "custom message");
+            exceptionMessage: "custom message"
+        );
 
         Assert.That(failures, Has.Count.EqualTo(1));
         Assert.That(failures.First().Reason.Message, Is.EqualTo("custom message"));
     }
 
     [Test]
+    public void AppendActionFailure_ForConcurrentBag_FormatsS3LikeExceptionsCompactly()
+    {
+        var failures = new ConcurrentBag<ActionFailure>();
+        var exception = new FakeAmazonS3Exception("request timed out")
+        {
+            StatusCode = HttpStatusCode.ServiceUnavailable,
+            ErrorCode = "RequestTimeout",
+            RequestId = "req-123",
+        };
+
+        failures.AppendActionFailure(
+            exception,
+            SessionName,
+            Globals.Logger,
+            "Consumer",
+            "S3Consumer",
+            actionProtocol: "S3"
+        );
+
+        var reason = failures.Single().Reason;
+        Assert.Multiple(() =>
+        {
+            Assert.That(reason.Message, Does.Contain("S3 operation failed"));
+            Assert.That(reason.Message, Does.Contain("StatusCode=503 ServiceUnavailable"));
+            Assert.That(reason.Message, Does.Contain("ErrorCode=RequestTimeout"));
+            Assert.That(reason.Message, Does.Not.Contain("RequestId"));
+            Assert.That(reason.Description, Does.Contain("ExceptionType: FakeAmazonS3Exception"));
+            Assert.That(reason.Description, Does.Contain("RequestId: req-123"));
+            Assert.That(reason.Description, Does.Not.Contain("   at "));
+        });
+    }
+
+    [Test]
+    public void AppendActionFailure_ForNestedAggregateException_DeduplicatesRepeatedS3Causes()
+    {
+        var failures = new List<ActionFailure>();
+        var first = CreateS3Failure("repeated object read failure");
+        var second = CreateS3Failure("repeated object read failure");
+        var exception = new AggregateException(
+            new AggregateException(first),
+            new AggregateException(second, second)
+        );
+
+        failures.AppendActionFailure(
+            exception,
+            SessionName,
+            Globals.Logger,
+            "ChunkConsumer",
+            "S3Consumer",
+            actionProtocol: "S3"
+        );
+
+        Assert.That(failures, Has.Count.EqualTo(1));
+        var reason = failures.Single().Reason;
+        Assert.Multiple(() =>
+        {
+            Assert.That(reason.Message, Does.StartWith("S3 operation failed:"));
+            Assert.That(reason.Message, Does.Contain("repeated object read failure"));
+            Assert.That(reason.Message, Does.Not.Contain("One or more errors occurred"));
+            Assert.That(reason.Message, Does.Not.Contain(") ("));
+            Assert.That(
+                CountOccurrences(reason.Message, "repeated object read failure"),
+                Is.EqualTo(1)
+            );
+            Assert.That(
+                CountOccurrences(reason.Description, "repeated object read failure"),
+                Is.EqualTo(1)
+            );
+            Assert.That(reason.Description, Does.Not.Contain("Inner Exception #"));
+        });
+    }
+
+    [Test]
+    public void AppendActionFailure_ForS3AggregateWithDifferentRequestIds_DeduplicatesSemantically()
+    {
+        var firstOrderFailures = new List<ActionFailure>();
+        var reverseOrderFailures = new List<ActionFailure>();
+        var first = CreateS3Failure(
+            "repeated object read failure",
+            requestId: "request-z",
+            amazonId2: "host-z"
+        );
+        var second = CreateS3Failure(
+            "repeated object read failure",
+            requestId: "request-a",
+            amazonId2: "host-a"
+        );
+
+        firstOrderFailures.AppendActionFailure(
+            new AggregateException(first, second),
+            SessionName,
+            Globals.Logger,
+            "ChunkConsumer",
+            "S3Consumer",
+            actionProtocol: "S3"
+        );
+        reverseOrderFailures.AppendActionFailure(
+            new AggregateException(second, first),
+            SessionName,
+            Globals.Logger,
+            "ChunkConsumer",
+            "S3Consumer",
+            actionProtocol: "S3"
+        );
+
+        const string expectedMessage =
+            "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, Message=repeated object read failure";
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstOrderFailures, Has.Count.EqualTo(1));
+            Assert.That(reverseOrderFailures, Has.Count.EqualTo(1));
+            Assert.That(firstOrderFailures.Single(), Is.EqualTo(reverseOrderFailures.Single()));
+            Assert.That(firstOrderFailures.Single().Reason.Message, Is.EqualTo(expectedMessage));
+            Assert.That(firstOrderFailures.Single().Reason.Message, Does.Not.Contain("RequestId"));
+            Assert.That(firstOrderFailures.Single().Reason.Message, Does.Not.Contain("AmazonId2"));
+            Assert.That(
+                firstOrderFailures.Single().Reason.Message,
+                Does.Not.Contain("One or more errors occurred")
+            );
+            Assert.That(firstOrderFailures.Single().Reason.Message, Does.Not.Contain(") ("));
+            Assert.That(
+                firstOrderFailures.Single().Reason.Description,
+                Does.Contain("RequestId: request-a")
+            );
+            Assert.That(
+                firstOrderFailures.Single().Reason.Description,
+                Does.Contain("AmazonId2: host-a")
+            );
+            Assert.That(
+                firstOrderFailures.Single().Reason.Description,
+                Does.Not.Contain("request-z")
+            );
+        });
+    }
+
+    [Test]
+    public void AppendActionFailure_ForAggregateException_PreservesDistinctCausesInStableOrder()
+    {
+        var failures = new List<ActionFailure>();
+        var exception = new AggregateException(
+            new InvalidOperationException("zeta"),
+            new AggregateException(
+                new ArgumentException("alpha"),
+                new InvalidOperationException("zeta")
+            )
+        );
+
+        failures.AppendActionFailure(
+            exception,
+            SessionName,
+            Globals.Logger,
+            "Publisher",
+            "PublishAction"
+        );
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(failures, Has.Count.EqualTo(2));
+            Assert.That(
+                failures.Select(failure => failure.Reason.Message),
+                Is.EqualTo(new[] { "alpha", "zeta" })
+            );
+            Assert.That(
+                failures.Select(failure => failure.Reason.Description),
+                Has.All.Not.Contain("One or more errors occurred")
+            );
+        });
+    }
+
+    [Test]
+    public void NormalizeActionFailures_DeduplicatesExactFailuresAndSortsDeterministically()
+    {
+        var repeated = new ActionFailure
+        {
+            Name = "action-z",
+            ActionType = "Consumer",
+            Reason = new Reason { Message = "same", Description = "same description" },
+        };
+        var distinct = repeated with
+        {
+            Name = "action-a",
+            Reason = new Reason { Message = "different", Description = "different description" },
+        };
+
+        var normalized = ActionFailureNormalizer.Normalize([repeated, distinct, repeated]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(normalized, Has.Count.EqualTo(2));
+            Assert.That(
+                normalized.Select(failure => failure.Name),
+                Is.EqualTo(new[] { "action-a", "action-z" })
+            );
+        });
+    }
+
+    [Test]
+    public void NormalizeActionFailures_CanonicalizesEquivalentWhitespaceIndependentlyOfInputOrder()
+    {
+        var nonS3CrLf = new ActionFailure
+        {
+            Name = "Publisher",
+            ActionType = "Publisher",
+            Reason = new Reason
+            {
+                Message = "  publish failed\r\n",
+                Description = "  first line\r\nsecond line  ",
+            },
+        };
+        var nonS3Lf = nonS3CrLf with
+        {
+            Reason = new Reason
+            {
+                Message = "publish failed",
+                Description = "first line\nsecond line",
+            },
+        };
+        var s3CrLf = new ActionFailure
+        {
+            Name = "S3Consumer",
+            ActionType = "ChunkConsumer",
+            Reason = new Reason
+            {
+                Message =
+                    "  S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, Message=missing object\r\n",
+                Description = "  RequestId: request-a\r\nAmazonId2: host-a  ",
+            },
+        };
+        var s3Lf = s3CrLf with
+        {
+            Reason = new Reason
+            {
+                Message =
+                    "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, Message=missing object",
+                Description = "RequestId: request-a\nAmazonId2: host-a",
+            },
+        };
+
+        var forward = ActionFailureNormalizer.Normalize([nonS3CrLf, s3Lf, nonS3Lf, s3CrLf]);
+        var reverse = ActionFailureNormalizer.Normalize([s3CrLf, nonS3Lf, s3Lf, nonS3CrLf]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(forward, Is.EqualTo(reverse));
+            Assert.That(forward, Has.Count.EqualTo(2));
+            Assert.That(
+                forward.Single(failure => failure.Name == "Publisher").Reason,
+                Is.EqualTo(
+                    new Reason
+                    {
+                        Message = "publish failed",
+                        Description = "first line\nsecond line",
+                    }
+                )
+            );
+            Assert.That(
+                forward.Single(failure => failure.Name == "S3Consumer").Reason,
+                Is.EqualTo(
+                    new Reason
+                    {
+                        Message =
+                            "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, Message=missing object",
+                        Description = "RequestId: request-a\nAmazonId2: host-a",
+                    }
+                )
+            );
+        });
+    }
+
+    [Test]
+    public void NormalizeActionFailures_CollapsesStructuredS3FailuresWithDifferentDiagnostics()
+    {
+        var first = new ActionFailure
+        {
+            Name = "S3Consumer",
+            ActionType = "ChunkConsumer",
+            Reason = new Reason
+            {
+                Message =
+                    "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, RequestId=request-z, AmazonId2=host-z, Message=missing object",
+                Description = "RequestId: request-z\nAmazonId2: host-z",
+            },
+        };
+        var second = first with
+        {
+            Reason = new Reason
+            {
+                Message =
+                    "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, RequestId=request-a, AmazonId2=host-a, Message=missing object",
+                Description = "RequestId: request-a\nAmazonId2: host-a",
+            },
+        };
+
+        var normalized = ActionFailureNormalizer.Normalize([first, second]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(normalized, Has.Count.EqualTo(1));
+            Assert.That(
+                normalized.Single().Reason.Message,
+                Is.EqualTo(
+                    "S3 operation failed: StatusCode=404 NotFound, ErrorCode=NoSuchKey, Message=missing object"
+                )
+            );
+            Assert.That(normalized.Single().Reason.Description, Does.Contain("request-a"));
+            Assert.That(normalized.Single().Reason.Description, Does.Contain("host-a"));
+        });
+    }
+
+    [Test]
     public void InternalCommunicationData_InheritsCommunicationDataContract_ForInputData()
     {
-        var input = new List<DetailedData<string>>
-        {
-            new() { Body = "input-body" }
-        };
-        var output = new List<DetailedData<string>?>
-        {
-            new() { Body = "output-body" }
-        };
-        var internalCommunicationData = new QaaS.Runner.Sessions.Actions.InternalCommunicationData<string>
-        {
-            Input = input,
-            Output = output,
-            InputSerializationType = SerializationType.Json,
-            OutputSerializationType = SerializationType.Binary
-        };
+        var input = new List<DetailedData<string>> { new() { Body = "input-body" } };
+        var output = new List<DetailedData<string>?> { new() { Body = "output-body" } };
+        var internalCommunicationData =
+            new QaaS.Runner.Sessions.Actions.InternalCommunicationData<string>
+            {
+                Input = input,
+                Output = output,
+                InputSerializationType = SerializationType.Json,
+                OutputSerializationType = SerializationType.Binary,
+            };
 
         CommunicationData<string> communicationData = internalCommunicationData;
 
@@ -136,7 +456,10 @@ public class SessionExtensionsTests
     {
         var context = CreationalFunctions.CreateContext(SessionName, []);
         var failures = new ConcurrentBag<ActionFailure>();
-        var action = new ExceptionalAction("ExceptionalAction", new InvalidOperationException("boom"));
+        var action = new ExceptionalAction(
+            "ExceptionalAction",
+            new InvalidOperationException("boom")
+        );
 
         var task = SessionExtensions.CreateTaskFromAction(context, action, SessionName, failures);
         task.GetAwaiter().GetResult();
@@ -158,7 +481,10 @@ public class SessionExtensionsTests
 
         Assert.That(task.Result, Is.Null);
         Assert.That(failures, Has.Count.EqualTo(1));
-        Assert.That(failures.First().Reason.Message, Is.EqualTo("Action CanceledAction was canceled"));
+        Assert.That(
+            failures.First().Reason.Message,
+            Is.EqualTo("Action CanceledAction was canceled")
+        );
     }
 
     [Test]
@@ -185,10 +511,15 @@ public class SessionExtensionsTests
         var context = new InternalContext
         {
             Logger = Globals.Logger,
-            InternalRunningSessions = new RunningSessions(new Dictionary<string, RunningSessionData<object, object>>())
+            InternalRunningSessions = new RunningSessions(
+                new Dictionary<string, RunningSessionData<object, object>>()
+            ),
         };
         var failures = new ConcurrentBag<ActionFailure>();
-        var action = new ExceptionalAction("MissingSessionAction", new InvalidOperationException("boom"));
+        var action = new ExceptionalAction(
+            "MissingSessionAction",
+            new InvalidOperationException("boom")
+        );
 
         var task = SessionExtensions.CreateTaskFromAction(context, action, SessionName, failures);
 
@@ -202,15 +533,14 @@ public class SessionExtensionsTests
     public void RunningSessionHelpers_SetGetAndRemoveSessionData()
     {
         var context = CreationalFunctions.CreateContext(SessionName, []);
-        var runningSession = new RunningSessionData<object, object>
-        {
-            Inputs = [],
-            Outputs = []
-        };
+        var runningSession = new RunningSessionData<object, object> { Inputs = [], Outputs = [] };
 
         context.SetRunningSession("other-session", runningSession);
 
-        Assert.That(context.TryGetRunningSession("other-session", out var foundRunningSession), Is.True);
+        Assert.That(
+            context.TryGetRunningSession("other-session", out var foundRunningSession),
+            Is.True
+        );
         Assert.That(foundRunningSession, Is.SameAs(runningSession));
         Assert.That(context.GetRunningSession("other-session"), Is.SameAs(runningSession));
         Assert.That(context.RemoveRunningSession("other-session"), Is.True);
@@ -248,16 +578,41 @@ public class SessionExtensionsTests
         {
             return new InternalCommunicationData
             {
-                Output = [new DetailedData<object> { Body = "ok" }]
+                Output = [new DetailedData<object> { Body = "ok" }],
             };
         }
     }
 
-    private sealed class ExceptionalAction(string name, Exception exceptionToThrow) : SessionAction(name, Globals.Logger)
+    private sealed class ExceptionalAction(string name, Exception exceptionToThrow)
+        : SessionAction(name, Globals.Logger)
     {
         internal override InternalCommunicationData Act()
         {
             throw exceptionToThrow;
         }
     }
+
+    private sealed class FakeAmazonS3Exception(string message) : Exception(message)
+    {
+        public HttpStatusCode StatusCode { get; init; }
+        public string? ErrorCode { get; init; }
+        public string? RequestId { get; init; }
+        public string? AmazonId2 { get; init; }
+    }
+
+    private static FakeAmazonS3Exception CreateS3Failure(
+        string message,
+        string requestId = "same-request",
+        string amazonId2 = "same-host"
+    ) =>
+        new(message)
+        {
+            StatusCode = HttpStatusCode.NotFound,
+            ErrorCode = "NoSuchKey",
+            RequestId = requestId,
+            AmazonId2 = amazonId2,
+        };
+
+    private static int CountOccurrences(string value, string expected) =>
+        value.Split(expected, StringSplitOptions.None).Length - 1;
 }

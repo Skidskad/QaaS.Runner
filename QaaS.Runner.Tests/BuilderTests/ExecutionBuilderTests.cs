@@ -15,6 +15,9 @@ using QaaS.Framework.SDK.Session.SessionDataObjects;
 using QaaS.Framework.SDK.Session.SessionDataObjects.RunningSessionsObjects;
 using QaaS.Runner.Assertions.ConfigurationObjects;
 using QaaS.Runner.Assertions.ConfigurationObjects.LinkConfigs;
+using QaaS.Runner.Assertions.ConfigurationObjects.ReporterConfigs;
+using QaaS.Runner.Assertions.Reporters;
+using QaaS.Runner.Assertions.Reporters.Allure;
 using QaaS.Runner.Infrastructure;
 using QaaS.Runner.Sessions.Actions.MockerCommands;
 using QaaS.Runner.Sessions.Actions.Probes;
@@ -109,8 +112,10 @@ public class ExecutionBuilderTests
 
         _ = builder.Build();
 
-        Assert.That(builder.Sessions ?? [], Has.Length.EqualTo(1));
-        Assert.That(builder.Sessions[0].Stage, Is.EqualTo(0));
+        var sessions = builder.Sessions ?? [];
+
+        Assert.That(sessions, Has.Length.EqualTo(1));
+        Assert.That(sessions[0].Stage, Is.EqualTo(0));
     }
 
     [Test]
@@ -129,11 +134,7 @@ public class ExecutionBuilderTests
         {
             builder.UpdateSession("missing", new SessionBuilder());
             builder.RemoveSession("missing");
-            builder.UpdateAssertion("missing", new AssertionBuilder
-            {
-                AssertionInstance = null!,
-                Reporter = null!
-            });
+            builder.UpdateAssertion("missing", new AssertionBuilder());
             builder.RemoveAssertion("missing");
             builder.UpdateStorageAt(0, new StorageBuilder());
             builder.RemoveStorageAt(0);
@@ -442,7 +443,7 @@ public class ExecutionBuilderTests
         });
 
         var builder = new ExecutionBuilder(context, ExecutionType.Run, null, null, null, null);
-        var session = builder.Sessions.Single();
+        var session = (builder.Sessions ?? []).Single();
         var publisher = session.Publishers!.Single();
         var consumer = session.Consumers!.Single();
         var publisherRabbitMq = (RabbitMqSenderConfig?)typeof(QaaS.Runner.Sessions.Actions.Publishers.Builders.PublisherBuilder)
@@ -477,7 +478,7 @@ public class ExecutionBuilderTests
         });
 
         var builder = new ExecutionBuilder(context, ExecutionType.Template, null, null, null, null);
-        var session = builder.Sessions.Single();
+        var session = (builder.Sessions ?? []).Single();
         var stage = session.Stages.Single();
 
         Assert.Multiple(() =>
@@ -502,7 +503,7 @@ public class ExecutionBuilderTests
         });
 
         var builder = new ExecutionBuilder(context, ExecutionType.Template, null, null, null, null);
-        var consumer = builder.Sessions.Single().Consumers!.Single();
+        var consumer = (builder.Sessions ?? []).Single().Consumers!.Single();
 
         Assert.Multiple(() =>
         {
@@ -544,7 +545,7 @@ public class ExecutionBuilderTests
         });
 
         var builder = new ExecutionBuilder(context, ExecutionType.Run, null, null, null, null);
-        var session = builder.Sessions.Single();
+        var session = (builder.Sessions ?? []).Single();
         var publisher = session.Publishers!.Single();
         Assert.Throws<InvalidConfigurationsException>(() => builder.Build());
         var validationResults = (IReadOnlyList<System.ComponentModel.DataAnnotations.ValidationResult>)typeof(ExecutionBuilder)
@@ -838,6 +839,42 @@ public class ExecutionBuilderTests
     }
 
     [Test]
+    public void TemplateRendering_WithReportPortalConfiguration_PreservesReporterSection()
+    {
+        var builder = new ExecutionBuilder()
+            .ExecutionType(ExecutionType.Template)
+            .WithMetadata(new MetaDataConfig
+            {
+                Team = "Smoke",
+                System = "QaaS"
+            });
+        builder.Reporters!.ConfigureReportPortal(new ReportPortalConfig
+        {
+            Enabled = true,
+            Endpoint = "https://reportportal.example/api/",
+            ApiKey = "api-key",
+            Project = "project"
+        });
+
+        typeof(ExecutionBuilder)
+            .GetMethod("InitializeContext", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(builder, []);
+        typeof(ExecutionBuilder)
+            .GetMethod("StoreRenderedConfigurationTemplate", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(builder, []);
+
+        var renderedTemplate = ((InternalContext)typeof(ExecutionBuilder).BaseType!
+                .GetField("Context", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(builder)!)
+            .GetRenderedConfigurationTemplate();
+
+        Assert.That(renderedTemplate,
+            Does.Contain("Reporters:")
+                .And.Contain("ReportPortal:")
+                .And.Contain("Endpoint: https://reportportal.example/api/"));
+    }
+
+    [Test]
     public void ValidateCollection_WithNullCollectionAndNullItems_DoesNotAddValidationResults()
     {
         var builder = new ExecutionBuilder();
@@ -931,6 +968,66 @@ public class ExecutionBuilderTests
         });
     }
 
+    [TestCase(ExecutionType.Run)]
+    [TestCase(ExecutionType.Assert)]
+    public void BuildReports_WithReportingExecutionType_UsesReporterFactoryBuiltInReporters(
+        ExecutionType executionType)
+    {
+        ReportPortalConfig.RegisterDefaults(enabled: false);
+        var context = CreateLoadedContext(new Dictionary<string, string?>());
+        var builder = new ExecutionBuilder(context, executionType, null, null, null, null)
+        {
+            Assertions =
+            [
+                new AssertionBuilder
+                {
+                    Name = "assertion-display",
+                }
+            ]
+        };
+
+        var builtReports = ((System.Collections.IEnumerable)typeof(ExecutionBuilder)
+                .GetMethod("BuildReports", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(builder, [])!)
+            .Cast<IReporter>()
+            .ToList();
+
+        Assert.That(builtReports, Has.Count.EqualTo(1));
+        Assert.That(builtReports[0], Is.TypeOf<AllureReporter>());
+    }
+
+    [TestCase(ExecutionType.Template)]
+    [TestCase(ExecutionType.Act)]
+    public void BuildReports_WithNonReportingExecutionType_DoesNotBuildReporters(ExecutionType executionType)
+    {
+        var context = CreateLoadedContext(new Dictionary<string, string?>());
+        var builder = new ExecutionBuilder(context, executionType, null, null, null, null)
+        {
+            Assertions =
+            [
+                new AssertionBuilder
+                {
+                    Name = "assertion-display",
+                }
+            ]
+        };
+        builder.Reporters!.ConfigureReportPortal(new ReportPortalConfig
+        {
+            Enabled = true,
+            Endpoint = "https://reportportal.example/api/",
+            ApiKey = "api-key",
+            Project = "project"
+        });
+
+        var builtReports = ((System.Collections.IEnumerable)typeof(ExecutionBuilder)
+                .GetMethod("BuildReports", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(builder, [])!)
+            .Cast<IReporter>()
+            .ToList();
+
+        Assert.That(builtReports, Is.Empty);
+    }
+
     [Test]
     public void BuildDataSources_WithoutInitializedBuildScope_ThrowsInvalidOperationException()
     {
@@ -963,8 +1060,6 @@ public class ExecutionBuilderTests
         {
             Name = "test-assertion",
             Assertion = "Equals",
-            AssertionInstance = null,
-            Reporter = null
         }.HookNamed(nameof(TestAssertion));
         builder.AddAssertion(assertionBuilder);
 
@@ -1038,8 +1133,6 @@ public class ExecutionBuilderTests
         {
             Name = "test-assertion",
             Assertion = "Equals",
-            AssertionInstance = null,
-            Reporter = null
         }.HookNamed(nameof(TestAssertion));
         builder.AddAssertion(assertionBuilder);
 
@@ -1111,7 +1204,4 @@ public class ExecutionBuilderTests
 
     private sealed record LogEntry(LogLevel LogLevel, string Message);
 }
-
-
-
 

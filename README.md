@@ -3,8 +3,7 @@
 Execution orchestration package for running QaaS test workflows from YAML configuration.
 
 [![CI](https://github.com/TheSmokeTeam/QaaS.Runner/actions/workflows/ci.yml/badge.svg)](https://github.com/TheSmokeTeam/QaaS.Runner/actions/workflows/ci.yml)
-[![Line Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/eldarush/9a06894c5b6da0ff9f2f706b0a71bbb8/raw/line-coverage-badge.json)](https://github.com/TheSmokeTeam/QaaS.Runner/actions/workflows/ci.yml)
-[![Branch Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/eldarush/9a06894c5b6da0ff9f2f706b0a71bbb8/raw/branch-coverage-badge.json)](https://github.com/TheSmokeTeam/QaaS.Runner/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF)](./.github/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-qaas--docs-blue)](https://thesmoketeam.github.io/qaas-docs/)
 [![.NET](https://img.shields.io/badge/.NET-10.0-512BD4)](https://dotnet.microsoft.com/)
 
@@ -13,6 +12,7 @@ Execution orchestration package for running QaaS test workflows from YAML config
 - [Packages](#packages)
 - [Projects](#projects)
 - [Quick Start](#quick-start)
+- [ReportPortal](#reportportal)
 - [Documentation](#documentation)
 
 ## Overview
@@ -29,12 +29,13 @@ This repository contains one solution: [`QaaS.Runner.sln`](./QaaS.Runner.sln).
 ### [QaaS.Runner](./QaaS.Runner/)
 - CLI/bootstrap entrypoint for `run`, `act`, `assert`, `template`, and `execute` verbs.
 - Builds execution contexts and routes each execution type through the right logic chain.
-- Orchestrates setup/teardown and optional Allure result serving.
+- Orchestrates setup/teardown, optional Allure result serving, ReportPortal access validation, and final ReportPortal publishing.
 
 ### [QaaS.Runner.Assertions](./QaaS.Runner.Assertions/)
 - Builds assertion runtime objects from configured hooks and filters.
 - Executes assertions against session/data-source outputs.
 - Writes Allure results, links, and attachments.
+- Can also publish the same runner-produced assertion results into ReportPortal.
 
 ### [QaaS.Runner.Sessions](./QaaS.Runner.Sessions/)
 - Session runtime with staged action execution.
@@ -62,6 +63,15 @@ Upgrade package:
 dotnet add package QaaS.Runner --version <target-version>
 dotnet restore
 ```
+
+## ReportPortal
+QaaS can send its assertion results to an existing ReportPortal instance. Configure `Reporters.ReportPortal` with `Enabled`, `Endpoint`, `ApiKey`, and an optional `Project` (defaults to `MetaData.Team`). YAML values override package defaults.
+
+- QaaS does not create ReportPortal projects or credentials; the target project and API key must already exist.
+- Only `run` and `assert` use ReportPortal. `template` still renders its configuration, while `template` and `act` perform no validation or publishing.
+- Immediately before the first ReportPortal-enabled `run` or `assert`, the runner validates every enabled launch group with a read-only project lookup. If validation fails, it returns exit code `1` and skips that command and everything after it; earlier commands remain completed.
+- Assertion results are queued locally and published during cleanup. Compatible ReportPortal configurations share a launch.
+- Final publishing errors are logged without changing the execution-derived exit code. Allure output is unaffected.
 
 ## Documentation
 - Official docs: [thesmoketeam.github.io/qaas-docs](https://thesmoketeam.github.io/qaas-docs/)

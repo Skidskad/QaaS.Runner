@@ -44,8 +44,6 @@ public class ExecutionBuilderCrudTests
         {
             Name = "assertion-a",
             Assertion = "Equals",
-            AssertionInstance = null!,
-            Reporter = null!
         }.HookNamed("AssertionHook");
         var storage = new StorageBuilder().Configure(new S3Config());
         var dataSource = new DataSourceBuilder().Named("source-a").HookNamed("GeneratorHook");
@@ -102,7 +100,9 @@ public class ExecutionBuilderCrudTests
 
         builder.UpdateSession("session-a", updated);
 
-        Assert.That(builder.Sessions[0], Is.SameAs(updated));
+        var sessions = builder.Sessions ?? [];
+
+        Assert.That(sessions[0], Is.SameAs(updated));
     }
 
     [Test]
@@ -114,8 +114,10 @@ public class ExecutionBuilderCrudTests
 
         builder.RemoveSession("session-a");
 
-        Assert.That(builder.Sessions ?? [], Has.Length.EqualTo(1));
-        Assert.That(builder.Sessions[0].Name, Is.EqualTo("session-b"));
+        var sessions = builder.Sessions ?? [];
+
+        Assert.That(sessions, Has.Length.EqualTo(1));
+        Assert.That(sessions[0].Name, Is.EqualTo("session-b"));
     }
 
     [Test]
@@ -127,8 +129,10 @@ public class ExecutionBuilderCrudTests
 
         builder.UpdateSession("does-not-exist", replacement);
 
-        Assert.That(builder.Sessions ?? [], Has.Length.EqualTo(1));
-        Assert.That(builder.Sessions[0], Is.SameAs(original));
+        var sessions = builder.Sessions ?? [];
+
+        Assert.That(sessions, Has.Length.EqualTo(1));
+        Assert.That(sessions[0], Is.SameAs(original));
     }
 
     [Test]
@@ -147,15 +151,11 @@ public class ExecutionBuilderCrudTests
         {
             Name = "assertion-a",
             Assertion = "Equals",
-            AssertionInstance = null!,
-            Reporter = null!
         }.HookNamed("HookA");
         var updatedAssertion = new AssertionBuilder
         {
             Name = "assertion-a",
             Assertion = "NotEquals",
-            AssertionInstance = null!,
-            Reporter = null!
         }.HookNamed("HookB");
 
         var builder = new ExecutionBuilder()
@@ -172,10 +172,12 @@ public class ExecutionBuilderCrudTests
             Variables = []
         }));
 
+        var assertions = builder.Assertions ?? [];
+
         Assert.Multiple(() =>
         {
-            Assert.That(builder.Assertions ?? [], Has.Length.EqualTo(1));
-            Assert.That(builder.Assertions[0], Is.SameAs(updatedAssertion));
+            Assert.That(assertions, Has.Length.EqualTo(1));
+            Assert.That(assertions[0], Is.SameAs(updatedAssertion));
             Assert.That((builder.Assertions ?? []).FirstOrDefault(x => x.Name == "assertion-a"), Is.SameAs(updatedAssertion));
             Assert.That(builder.DataSources, Has.Length.EqualTo(0));
             Assert.That((builder.DataSources ?? []).FirstOrDefault(x => x.Name == "source-a"), Is.Null);
@@ -190,8 +192,25 @@ public class ExecutionBuilderCrudTests
             Assert.That((builder.Links ?? []).ElementAtOrDefault(0), Is.Null);
         });
     }
+
+    [Test]
+    public void UpdateReporters_ShouldReplaceConfiguredReporterBuilder()
+    {
+        var originalReporters = new ReporterBuilder().ShouldSaveLogs(true);
+        var updatedReporters = new ReporterBuilder().ShouldSaveAttachments(true);
+        var builder = new ExecutionBuilder
+        {
+            Reporters = originalReporters
+        };
+
+        var result = builder.UpdateReporters(updatedReporters);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result, Is.SameAs(builder));
+            Assert.That(builder.Reporters, Is.SameAs(updatedReporters));
+        });
+    }
 }
-
-
 
 

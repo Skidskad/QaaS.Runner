@@ -1,7 +1,10 @@
 using System;
+using System.Collections;
 using NUnit.Framework;
+using QaaS.Framework.SDK;
 using QaaS.Framework.Serialization;
 using QaaS.Runner.Assertions.AssertionObjects;
+using QaaS.Runner.Assertions.Reporters;
 
 namespace QaaS.Runner.Assertions.Tests;
 
@@ -18,6 +21,7 @@ public class BaseReporterTests
         {
             return GetAttachmentTypeBySerializationType(serializationType);
         }
+
     }
 
     [TestCase(SerializationType.Binary, "application/octet-stream")]
@@ -42,4 +46,28 @@ public class BaseReporterTests
         Assert.Throws<InvalidOperationException>(() =>
             TestReporter.ResolveAttachmentType((SerializationType)999));
     }
+
+    [Test]
+    public void ExtractMetadataAttributes_ExcludesTeamAndSystemAndFlattensExtraLabels()
+    {
+        var metaData = new MetaDataConfig
+        {
+            Team = "Smoke",
+            System = "QaaS"
+        };
+        var extraLabelsProperty = metaData.GetType().GetProperty("ExtraLabels");
+        Assert.That(extraLabelsProperty, Is.Not.Null, "MetaDataConfig.ExtraLabels must exist for ReportPortal grouping.");
+        var extraLabels = (IDictionary)Activator.CreateInstance(extraLabelsProperty!.PropertyType)!;
+        extraLabels["Component"] = "Auth";
+        extraLabels["Area"] = "Login";
+        extraLabelsProperty.SetValue(metaData, extraLabels);
+
+        var attributes = BaseReporter.ExtractMetadataAttributes(metaData);
+
+        Assert.That(attributes.ContainsKey("Team"), Is.False);
+        Assert.That(attributes.ContainsKey("System"), Is.False);
+        Assert.That(attributes["Component"], Is.EqualTo("Auth"));
+        Assert.That(attributes["Area"], Is.EqualTo("Login"));
+    }
+
 }
