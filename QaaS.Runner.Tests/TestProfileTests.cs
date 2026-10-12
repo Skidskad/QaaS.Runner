@@ -70,6 +70,7 @@ public class TestProfileTests
         Assert.That(sessionNames, Contains.Item("BaseSession"));
         Assert.That(sessionNames, Contains.Item("ProfileBaseSession"));
         Assert.That(sessionNames, Contains.Item("DefaultCaseSession"));
+        Assert.That(caseBuilder.CaseName, Is.EqualTo("SampleTestCase"));
     }
 
     [Test]
@@ -113,5 +114,43 @@ public class TestProfileTests
         var caseBuilder = profile.Runner.ExecutionBuilders[0];
         var sessionNames = caseBuilder.Sessions.Select(s => s.Name).ToList();
         Assert.That(sessionNames, Contains.Item("HardcodedSession"));
+        Assert.That(caseBuilder.CaseName, Is.EqualTo("HardcodedTestCase"));
+    }
+
+    private class DerivedFieldProfile : TestProfile
+    {
+        private readonly string _configuredModule;
+
+        public DerivedFieldProfile(string moduleName) : base("local", addBaseCase: false)
+        {
+            _configuredModule = moduleName;
+        }
+
+        protected override string[] ProfileSpecificYamlFiles => [ _configuredModule ];
+        protected override string[] VariablesYamlFiles => [];
+
+        public string ReadConfiguredModule() => ProfileSpecificYamlFiles.FirstOrDefault() ?? "";
+    }
+
+    [Test]
+    public void TestProfile_DeferredInitialization_DerivedConstructorFieldsAvailable()
+    {
+        // Act
+        var profile = new DerivedFieldProfile("TestData/test.qaas.yaml");
+
+        // Assert - EnsureInitialized runs after derived constructor body, so _configuredModule is available
+        Assert.That(profile.ReadConfiguredModule(), Is.EqualTo("TestData/test.qaas.yaml"));
+        Assert.That(profile.Runner, Is.Not.Null);
+    }
+
+    [Test]
+    public void TestProfile_FilelessProfile_InitializesRunnableRunner()
+    {
+        // Arrange - DummyProfile supplies no YAMLs
+        var profile = new DummyProfile("local", addBaseCase: false);
+
+        // Act & Assert - verify Runner is initialized as a normal runnable runner
+        Assert.That(profile.Runner, Is.Not.Null);
+        Assert.That(profile.Runner.LastExitCode, Is.Null);
     }
 }

@@ -92,7 +92,7 @@ public static class RunnerCaseExpansionExtensions
         {
             ArgumentNullException.ThrowIfNull(testCase);
             var caseBuilder = baseBuilder.Clone();
-            caseBuilder.SetCase(testCase.GetType().Name);
+            caseBuilder.SetCase(testCase.Name);
             testCase.ModifyCaseExecutionBuilder(caseBuilder, variables);
             runner.ExecutionBuilders.Add(caseBuilder);
         }

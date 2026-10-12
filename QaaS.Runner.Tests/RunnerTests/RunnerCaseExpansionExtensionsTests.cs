@@ -20,6 +20,8 @@ public class RunnerCaseExpansionExtensionsTests
             _sessionName = sessionName;
         }
 
+        public override string Name => _sessionName;
+
         public override void ModifyCaseExecutionBuilder(ExecutionBuilder baseBuilder, Microsoft.Extensions.Configuration.IConfiguration? variables = null)
         {
             baseBuilder.AddSession(new SessionBuilder().Named(_sessionName));
@@ -139,9 +141,11 @@ public class RunnerCaseExpansionExtensionsTests
 
         Assert.That(firstClone.Sessions.Any(s => s.Name == "Case1Session"), Is.True);
         Assert.That(firstClone.Sessions.Any(s => s.Name == "Case2Session"), Is.False);
+        Assert.That(firstClone.CaseName, Is.EqualTo("Case1Session"));
 
         Assert.That(secondClone.Sessions.Any(s => s.Name == "Case2Session"), Is.True);
         Assert.That(secondClone.Sessions.Any(s => s.Name == "Case1Session"), Is.False);
+        Assert.That(secondClone.CaseName, Is.EqualTo("Case2Session"));
 
         // Ensure base builder is unmodified (remains clean)
         Assert.That(

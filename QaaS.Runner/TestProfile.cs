@@ -18,15 +18,37 @@ public abstract class TestProfile
 {
     private static readonly HttpClient HttpClient = new();
 
+    private Runner? _runner;
+    private IConfiguration? _variables;
+    private ExecutionBuilder? _baseExecutionBuilder;
+    private readonly object _initLock = new();
+    private bool _isInitialized;
+
     /// <summary>
     /// Gets or sets the underlying QaaS Runner instance for this profile.
     /// </summary>
-    public Runner Runner { get; protected set; }
+    public Runner Runner
+    {
+        get
+        {
+            EnsureInitialized();
+            return _runner!;
+        }
+        protected set => _runner = value;
+    }
 
     /// <summary>
     /// Gets the compiled, flattened variables configuration for this profile.
     /// </summary>
-    public IConfiguration Variables { get; protected set; }
+    public IConfiguration Variables
+    {
+        get
+        {
+            EnsureInitialized();
+            return _variables!;
+        }
+        protected set => _variables = value;
+    }
 
     /// <summary>
     /// The target test environment name (e.g., local, k8s, dev).
@@ -39,9 +61,22 @@ public abstract class TestProfile
     protected readonly bool _addBaseCase;
 
     /// <summary>
-    /// The base execution builder extracted from Bootstrap.New.
+    /// Optional custom command keyword (e.g. 'run', 'act', 'assert').
     /// </summary>
-    protected ExecutionBuilder BaseExecutionBuilder { get; set; }
+    protected readonly string _customCommandKeyword;
+
+    /// <summary>
+    /// The base execution builder extracted from Bootstrap.New or initialized for the profile.
+    /// </summary>
+    protected ExecutionBuilder BaseExecutionBuilder
+    {
+        get
+        {
+            EnsureInitialized();
+            return _baseExecutionBuilder!;
+        }
+        set => _baseExecutionBuilder = value;
+    }
 
     /// <summary>
     /// The list of test cases to be expanded and executed within this profile.
@@ -84,33 +119,62 @@ public abstract class TestProfile
     {
         _testEnv = testEnv;
         _addBaseCase = addBaseCase;
-        var runnerInitArgs = SetupRunnerInitArgs(customCommandKeyword);
+        _customCommandKeyword = customCommandKeyword;
+    }
 
-        Runner = Bootstrap.New(runnerInitArgs);
-        Runner.ExitProcessOnCompletion = false;
-
-        if (Runner.ExecutionBuilders.Count > 0)
+    /// <summary>
+    /// Ensures that profile runner initialization and configuration loading have run after derived construction.
+    /// </summary>
+    protected void EnsureInitialized()
+    {
+        if (_isInitialized) return;
+        lock (_initLock)
         {
-            BaseExecutionBuilder = Runner.ExecutionBuilders.First();
-            Runner.ExecutionBuilders.RemoveAt(0);
+            if (_isInitialized) return;
+            Initialize();
+            _isInitialized = true;
+        }
+    }
+
+    private void Initialize()
+    {
+        var runnerInitArgs = SetupRunnerInitArgs(_customCommandKeyword);
+
+        if (runnerInitArgs.Length > 0)
+        {
+            _runner = Bootstrap.New(runnerInitArgs);
         }
         else
         {
-            BaseExecutionBuilder = new ExecutionBuilder();
+            _runner = Bootstrap.CreateDefaultRunner<Runner>();
         }
 
-        Variables = BuildVariablesConfiguration();
+        _runner.ExitProcessOnCompletion = false;
+
+        if (_runner.ExecutionBuilders.Count > 0)
+        {
+            _baseExecutionBuilder = _runner.ExecutionBuilders.First();
+            _runner.ExecutionBuilders.RemoveAt(0);
+        }
+        else
+        {
+            _baseExecutionBuilder = new ExecutionBuilder();
+        }
+
+        _variables = BuildVariablesConfiguration();
     }
 
     /// <summary>
     /// Executes the full profile lifecycle:
     /// 1. Applies BaseCase if enabled.
     /// 2. Applies profile-specific baseline modifications.
-    /// 3. Clones and expands TestCases.
+    /// 3. Clones and expands TestCases with their logical names.
     /// 4. Runs the runner.
     /// </summary>
     public virtual void Execute()
     {
+        EnsureInitialized();
+
         if (_addBaseCase && BaseCase != null)
         {
             BaseCase.ModifyCaseExecutionBuilder(BaseExecutionBuilder, Variables);
@@ -224,6 +288,7 @@ public abstract class TestProfile
             foreach (var testCase in TestCases)
             {
                 ExecutionBuilder caseExecutionBuilder = BaseExecutionBuilder.Clone();
+                caseExecutionBuilder.SetCase(testCase.Name);
                 testCase.ModifyCaseExecutionBuilder(caseExecutionBuilder, Variables);
                 Runner.ExecutionBuilders.Add(caseExecutionBuilder);
             }

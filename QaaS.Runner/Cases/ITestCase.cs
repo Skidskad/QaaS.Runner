@@ -8,6 +8,11 @@ namespace QaaS.Runner.Cases;
 public interface ITestCase
 {
     /// <summary>
+    /// Gets the logical case name. Defaults to the concrete type name.
+    /// </summary>
+    string Name => GetType().Name;
+
+    /// <summary>
     /// Modifies the execution builder specifically for this test case using optional profile variables.
     /// </summary>
     /// <param name="baseBuilder">The cloned execution builder for this case.</param>

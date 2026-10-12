@@ -13,6 +13,9 @@ public abstract class TestCase<T> : ITestCase where T : TestCase<T>, new()
     /// </summary>
     public static T Instance { get; } = new();
 
+    /// <inheritdoc />
+    public virtual string Name => GetType().Name;
+
     /// <summary>
     /// Modifies the execution builder when profile variables are not required.
     /// </summary>
@@ -31,6 +34,9 @@ public abstract class TestCase<T> : ITestCase where T : TestCase<T>, new()
 /// </summary>
 public abstract class TestCase : ITestCase
 {
+    /// <inheritdoc />
+    public virtual string Name => GetType().Name;
+
     /// <summary>
     /// Modifies the execution builder when profile variables are not required.
     /// </summary>
