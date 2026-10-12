@@ -60,8 +60,7 @@ public static class RunnerCaseExpansionExtensions
         runner.ExtractBaseBuilder(0, setupBase);
 
     /// <summary>
-    /// Replaces the Runner's existing execution plan with builders cloned from the provided base builder,
-    /// one per test case, with each case's configuration applied using optional variables.
+    /// Adds builders cloned from the provided base builder, one per test case, with each case's configuration applied using optional variables.
     /// </summary>
     /// <param name="runner">The runner instance.</param>
     /// <param name="baseBuilder">The base execution builder to clone from.</param>
@@ -78,7 +77,6 @@ public static class RunnerCaseExpansionExtensions
         ArgumentNullException.ThrowIfNull(baseBuilder);
 
         runner.ExecutionBuilders ??= new List<ExecutionBuilder>();
-        runner.ExecutionBuilders.Clear();
 
         if (cases == null || cases.Length == 0)
         {
@@ -99,8 +97,7 @@ public static class RunnerCaseExpansionExtensions
     }
 
     /// <summary>
-    /// Replaces the Runner's existing execution plan with builders cloned from the provided base builder,
-    /// one per test case, without variables.
+    /// Adds builders cloned from the provided base builder, one per test case, without variables.
     /// </summary>
     /// <param name="runner">The runner instance.</param>
     /// <param name="baseBuilder">The base execution builder to clone from.</param>
